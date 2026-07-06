@@ -1,27 +1,18 @@
-# Phase 3 — Jupyter Server exposed via a MetalLB LoadBalancer
+# Phase 3 — Jupyter Server + VPN access blueprint
 #
-# This is the LoadBalancer-based ALTERNATIVE to 07 (which uses NodePort).
-# Apply EITHER 07 OR 08 — not both (they share the names jupyter / jupyter-token
-# / jupyter-config, so applying the second just reconfigures the first).
+# Access model (chosen because this cluster has NO Ingress controller — see report):
+#   VPN users sit on the 10.20.30.0/24 network and can reach every node's primary
+#   IP and the MetalLB pool (10.20.30.65-70). Two supported exposure paths:
+#     A) NodePort (default below)  -> http://<any-node-10.20.30-ip>:30888
+#     B) MetalLB LoadBalancer      -> dedicated 10.20.30.6x IP (uncomment Service B)
+#   Token auth (Secret below) is what protects the server across the VPN barrier.
 #
-# Why a LoadBalancer here: MetalLB (L2 mode, pool default-pool = 10.20.30.65-70)
-# hands the Service a dedicated, stable IP on the VPN-reachable 10.20.30.0/24
-# network — nicer than remembering a node IP + nodePort. There is NO Ingress
-# controller on this cluster, so LoadBalancer / NodePort are the two real options.
-#
-# Pool note: 10.20.30.65 is already taken by the default/nginx LoadBalancer, so
-# the next free address is normally 10.20.30.66. The annotation below REQUESTS
-# .66 explicitly; drop it to let MetalLB auto-assign the next free IP. Only 6 IPs
-# exist (65-70) — if all are used the EXTERNAL-IP stays <pending>.
-#
-# Apply:   kubectl apply -f 08-jupyter-loadbalancer.yaml
-# Get IP:  kubectl -n kt get svc jupyter -o jsonpath='{.status.loadBalancer.ingress[0].ip}{"\n"}'
-# Token:   kubectl -n kt get secret jupyter-token -o jsonpath='{.data.token}' | base64 -d; echo
-# Open:    http://<EXTERNAL-IP>/?token=<token>     (port 80)
-# Verify:  curl -sS -o /dev/null -w '%{http_code}\n' "http://<EXTERNAL-IP>/login"          # expect 200
-#          curl -sS -o /dev/null -w '%{http_code}\n' "http://<EXTERNAL-IP>/api"            # expect 403 (no token)
-#          curl -sS -o /dev/null -w '%{http_code}\n' "http://<EXTERNAL-IP>/api?token=<t>"  # expect 200
-# Cleanup: kubectl delete -f 08-jupyter-loadbalancer.yaml
+# Apply:   kubectl apply -f 07-jupyter-server.yaml
+# Token:   kubectl -n cluster-validation get secret jupyter-token -o jsonpath='{.data.token}' | base64 -d; echo
+# Access:  open http://<node-ip>:30888/?token=<token>  from a VPN-connected machine
+# Verify:  curl -sS -o /dev/null -w '%{http_code}\n' "http://<node-ip>:30888/login"   # expect 200
+#          curl -sS -o /dev/null -w '%{http_code}\n' "http://<node-ip>:30888/api"     # 403 w/o token, 200 with ?token=
+# Cleanup: kubectl delete -f 07-jupyter-server.yaml
 ---
 apiVersion: v1
 kind: Secret
@@ -77,6 +68,12 @@ spec:
                 secretKeyRef: {name: jupyter-token, key: token}
             - name: GRANT_SUDO
               value: "yes"
+            - name: NB_UID
+              value: "1022"
+            - name: NB_GID
+              value: "1023"
+            - name: CHOWN_HOME
+              value: "yes"  
           securityContext:
             runAsUser: 0  
           volumeMounts:
@@ -106,3 +103,16 @@ spec:
   selector: {app: jupyter}
   ports:
     - {name: http, port: 80, targetPort: 8888, nodePort: 30888}
+    
+# Service B — MetalLB LoadBalancer (alternative; gives a dedicated 10.20.30.6x IP).
+# Uncomment and delete Service A above if you prefer a stable IP over a node port.
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: jupyter-lb
+#   namespace: cluster-validation
+# spec:
+#   type: LoadBalancer
+#   selector: {app: jupyter}
+#   ports:
+#     - {name: http, port: 80, targetPort: 8888}
