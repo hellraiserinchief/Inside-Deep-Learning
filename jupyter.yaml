@@ -1,0 +1,108 @@
+# Phase 3 — Jupyter Server exposed via a MetalLB LoadBalancer
+#
+# This is the LoadBalancer-based ALTERNATIVE to 07 (which uses NodePort).
+# Apply EITHER 07 OR 08 — not both (they share the names jupyter / jupyter-token
+# / jupyter-config, so applying the second just reconfigures the first).
+#
+# Why a LoadBalancer here: MetalLB (L2 mode, pool default-pool = 10.20.30.65-70)
+# hands the Service a dedicated, stable IP on the VPN-reachable 10.20.30.0/24
+# network — nicer than remembering a node IP + nodePort. There is NO Ingress
+# controller on this cluster, so LoadBalancer / NodePort are the two real options.
+#
+# Pool note: 10.20.30.65 is already taken by the default/nginx LoadBalancer, so
+# the next free address is normally 10.20.30.66. The annotation below REQUESTS
+# .66 explicitly; drop it to let MetalLB auto-assign the next free IP. Only 6 IPs
+# exist (65-70) — if all are used the EXTERNAL-IP stays <pending>.
+#
+# Apply:   kubectl apply -f 08-jupyter-loadbalancer.yaml
+# Get IP:  kubectl -n kt get svc jupyter -o jsonpath='{.status.loadBalancer.ingress[0].ip}{"\n"}'
+# Token:   kubectl -n kt get secret jupyter-token -o jsonpath='{.data.token}' | base64 -d; echo
+# Open:    http://<EXTERNAL-IP>/?token=<token>     (port 80)
+# Verify:  curl -sS -o /dev/null -w '%{http_code}\n' "http://<EXTERNAL-IP>/login"          # expect 200
+#          curl -sS -o /dev/null -w '%{http_code}\n' "http://<EXTERNAL-IP>/api"            # expect 403 (no token)
+#          curl -sS -o /dev/null -w '%{http_code}\n' "http://<EXTERNAL-IP>/api?token=<t>"  # expect 200
+# Cleanup: kubectl delete -f 08-jupyter-loadbalancer.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jupyter-token
+  namespace: kt
+type: Opaque
+stringData:
+  token: "changeme-please-rotate-this-token"   # CHANGE + rotate before real use
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jupyter-config
+  namespace: kt 
+data:
+  jupyter_server_config.py: |
+    c.ServerApp.ip = '0.0.0.0'
+    c.ServerApp.port = 8888
+    c.ServerApp.open_browser = False
+    c.ServerApp.allow_root = True
+    c.ServerApp.root_dir = '/home/jovyan/work'
+    import os
+    c.ServerApp.token = os.environ.get('JUPYTER_TOKEN', '')
+    c.ServerApp.password = ''
+    c.ServerApp.allow_origin = '*'
+    c.ServerApp.trust_xheaders = True
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter
+  namespace: kt
+  labels: {app: jupyter}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: jupyter}
+  template:
+    metadata:
+      labels: {app: jupyter}
+    spec:
+      # For a GPU notebook (needs the device plugin) uncomment both lines:
+      nodeSelector: {kubernetes.io/hostname: cn4.texmin.local}
+      runtimeClassName: nvidia
+      containers:
+        - name: jupyter
+          image: quay.io/jupyter/base-notebook:latest   # swap for a CUDA image for GPU work
+          ports: [{containerPort: 8888}]
+          env:
+            - name: JUPYTER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: jupyter-token, key: token}
+            - name: GRANT_SUDO
+              value: "yes"
+          securityContext:
+            runAsUser: 0  
+          volumeMounts:
+            - {name: config, mountPath: /etc/jupyter/jupyter_server_config.py, subPath: jupyter_server_config.py}
+            - {name: work, mountPath: /home/jovyan/work}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits:   {cpu: "8", memory: 64Gi, nvidia.com/gpu: 1}
+            # GPU notebook: add  nvidia.com/gpu: 1  under limits
+          readinessProbe:
+            httpGet: {path: /login, port: 8888}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap: {name: jupyter-config}
+        - name: work
+          hostPath: {path: /home/dmadmin/code, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter
+  namespace: kt
+spec:
+  type: NodePort
+  selector: {app: jupyter}
+  ports:
+    - {name: http, port: 80, targetPort: 8888, nodePort: 30888}
